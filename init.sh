@@ -25,7 +25,7 @@
 set -eu
 
 # ---------------- Language Config ----------------
-LANG_CUR="en" # Default
+LANG_CUR="zh" # Default
 
 # ---------------- Automation Variables ----------------
 ARG_USER=""
