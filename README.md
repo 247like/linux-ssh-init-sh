@@ -38,7 +38,7 @@
 
 #### 1. 交互式运行 (推荐)
 ```bash
-curl -fsSL [https://raw.githubusercontent.com/247like/linux-ssh-init-sh/main/init.sh](https://raw.githubusercontent.com/247like/linux-ssh-init-sh/main/init.sh) -o init.sh && chmod +x init.sh && ./init.sh
+curl -fsSL https://raw.githubusercontent.com/247like/linux-ssh-init-sh/main/init.sh -o init.sh && chmod +x init.sh && ./init.sh
 ```
 
 #### 2. 强制使用英文界面
@@ -54,7 +54,7 @@ curl -fsSL [https://raw.githubusercontent.com/247like/linux-ssh-init-sh/main/ini
 *(配置 Root 用户、随机端口、从 GitHub 拉取公钥、开启 BBR、更新系统、自动确认)*
 
 ```bash
-curl -fsSL [https://raw.githubusercontent.com/247like/linux-ssh-init-sh/main/init.sh](https://raw.githubusercontent.com/247like/linux-ssh-init-sh/main/init.sh) | sh -s -- \
+curl -fsSL https://raw.githubusercontent.com/247like/linux-ssh-init-sh/main/init.sh | sh -s -- \
     --user=root \
     --port=random \
     --key-gh=247like \
@@ -67,7 +67,7 @@ curl -fsSL [https://raw.githubusercontent.com/247like/linux-ssh-init-sh/main/ini
 *(指定公钥来源，其他选项手动选择)*
 
 ```bash
-./init.sh --key-url=[https://my-server.com/id_ed25519.pub](https://my-server.com/id_ed25519.pub)
+./init.sh --key-url=https://my-server.com/id_ed25519.pub
 ```
 
 ### ⚙️ 参数详解
