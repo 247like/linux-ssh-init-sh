@@ -1,4 +1,4 @@
-# Linux Server Init & SSH Hardening Script (linux-ssh-init-sh)
+# Linux 服务器初始化与 SSH 安全加固
 
 <p align="center">
   <img src="https://img.shields.io/badge/Shell-POSIX_sh-blue?style=flat-square" alt="POSIX Shell">
@@ -37,14 +37,14 @@
 
 请以 **root** 身份运行。
 
-#### 标准运行 (交互式)
+#### 标准运行 (交互式)，默认中文
 ```bash
 curl -fsSL [https://raw.githubusercontent.com/247like/linux-ssh-init-sh/main/init.sh](https://raw.githubusercontent.com/247like/linux-ssh-init-sh/main/init.sh) -o init.sh && chmod +x init.sh && ./init.sh
 ```
 
-#### 强制中文界面
+#### 使用英文
 ```bash
-./init.sh --lang=zh
+curl -fsSL [https://raw.githubusercontent.com/247like/linux-ssh-init-sh/main/init.sh](https://raw.githubusercontent.com/247like/linux-ssh-init-sh/main/init.sh) -o init.sh && chmod +x init.sh && ./init.sh --lang=zh
 ```
 
 ### ⚙️ 参数说明
