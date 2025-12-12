@@ -1,16 +1,16 @@
-# Linux Server Init & SSH Hardening Script (linux-ssh-init-sh)
+# Linux Server Init & SSH Hardening Script
+
+<p align="center">
+  <strong>
+    <a href="README.md">🇨🇳 中文文档</a> | 🇺🇸 English
+  </strong>
+</p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Shell-POSIX_sh-blue?style=flat-square" alt="POSIX Shell">
   <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
   <img src="https://img.shields.io/github/v/release/247like/linux-ssh-init-sh?style=flat-square" alt="Release">
   <img src="https://img.shields.io/github/stars/247like/linux-ssh-init-sh?style=flat-square" alt="Stars">
-</p>
-
-<p align="center">
-  <strong>
-    <a href="README.md">🇨🇳 中文文档</a> | 🇺🇸 English
-  </strong>
 </p>
 
 ---
@@ -28,67 +28,88 @@ It safely handles **SSH key deployment**, **port changing**, **user creation**, 
     * **Atomic Verification**: Validates config with `sshd -t` before restarting. Automatically rolls back on failure to prevent downtime.
     * **Anti-Lockout**: If SSH keys fail to deploy, it **will not** disable password login, ensuring you don't lose access.
     * **Firewall Awareness**: Automatically detects and configures `ufw` or `firewalld` if port is changed.
-* **Smart Interactions**:
-    * Fetches public keys from **GitHub**, **URL**, or **Direct Paste**.
-    * **Random High Port**: Generates a random port between 20000-60000 and checks for availability using `ss`/`netstat`.
-    * **System Update** & **TCP BBR**: Optional one-click optimization.
+* **Automation Friendly**:
+    * Supports **Headless Mode**, allowing zero-interaction unattended installation via command line arguments.
+    * **Random High Port**: Automatically generates a random port between 20000-60000 and checks for availability.
 
 ### 🚀 Quick Start
 
 Run the following command as **root**.
 
-#### Standard Run (Interactive)
+#### 1. Interactive Run (Recommended)
 ```bash
-curl -fsSL [https://raw.githubusercontent.com/247like/linux-ssh-init-sh/main/init.sh](https://raw.githubusercontent.com/247like/linux-ssh-init-sh/main/init.sh) -o init.sh && chmod +x init.sh && ./init.sh
+curl -fsSL https://raw.githubusercontent.com/247like/linux-ssh-init-sh/main/init.sh -o init.sh && chmod +x init.sh && ./init.sh
 ```
 
-#### Force English UI
+#### 2. Force English UI
 ```bash
 ./init.sh --lang=en
 ```
 
-### ⚙️ Command Line Arguments
+### 🤖 Automation (Headless Mode)
 
-The script accepts the following arguments to control its behavior:
+Suitable for CI/CD pipelines or bulk provisioning. Use command line arguments to pass configurations and `--yes` to skip confirmation.
 
-| Argument | Description |
-| :--- | :--- |
-| `--lang=en` | Force the interactive interface to use **English**. |
-| `--lang=zh` | Force the interactive interface to use **Chinese** (Default behavior asks if not specified). |
-| `--strict` | **Strict Mode**. If enabled, the script will **exit immediately** if any critical step (like downloading keys or generating a port) fails, instead of falling back to defaults. Recommended for CI/CD or automated pipelines. |
+#### Full Automatic Example
+*(Configure Root user, random port, fetch key from GitHub, enable BBR, update system, auto-confirm)*
 
-### ⚙️ Strict Mode vs. Normal Mode
+```bash
+curl -fsSL https://raw.githubusercontent.com/247like/linux-ssh-init-sh/main/init.sh | sh -s -- \
+    --user=root \
+    --port=random \
+    --key-gh=247like \
+    --bbr \
+    --update \
+    --yes
+```
+
+#### Semi-Automatic Example
+*(Specify key URL, choose other options manually)*
+
+```bash
+./init.sh --key-url=https://my-server.com/id_ed25519.pub
+```
+
+### ⚙️ Arguments
+
+The script supports rich command-line arguments to control its behavior:
+
+| Category | Argument | Description |
+| :--- | :--- | :--- |
+| **Control** | `--lang=en` | Force English UI |
+| | `--yes` | **Auto Confirm**: Skip the final "Proceed?" prompt |
+| | `--strict` | **Strict Mode**: Exit immediately on error (see below) |
+| **User/Port** | `--user=root` | Specify login user (root or username) |
+| | `--port=22` | Keep default port 22 |
+| | `--port=random` | Generate random high port (20000-60000) |
+| | `--port=2222` | Specify a specific port number |
+| **Keys** | `--key-gh=username` | Fetch public key from GitHub |
+| | `--key-url=url` | Download public key from URL |
+| | `--key-raw="ssh-..."` | Pass public key string directly |
+| **System** | `--update` | Enable system package update |
+| | `--no-update` | Skip system update |
+| | `--bbr` | Enable TCP BBR congestion control |
+| | `--no-bbr` | Disable BBR |
+
+### ⚙️ Normal Mode vs. Strict Mode
 
 | Feature | Normal Mode (Default) | Strict Mode (`--strict`) |
 | :--- | :--- | :--- |
 | **Philosophy** | **"Don't Lockout"** (Best Effort) | **"Compliance First"** (Zero Tolerance) |
-| **Key Failure** | If key download fails, script **keeps Password Auth enabled** and warns you. | Script **exits immediately**. No changes applied. |
-| **Port Failure** | If random port generation fails, it falls back to **Port 22**. | Script **exits immediately**. |
+| **Key Failure** | If key download fails, script **keeps Password Auth enabled** and warns you.<br>👉 *Result: Server reachable but less secure.* | Script **exits immediately**. No changes applied.<br>👉 *Result: Deployment aborted, state unchanged.* |
+| **Port Failure** | If random port fails, it falls back to **Port 22**. | Script **exits immediately**. |
 | **Use Case** | Manual setup, unstable networks. | CI/CD pipelines, high-security requirements. |
 
-### 💡 Examples
+### 🛠️ Execution Details
 
-**1. Standard interactive installation (English):**
-```bash
-./init.sh --lang=en
-```
-
-**2. Strict mode for high-security requirements:**
-*If the GitHub key cannot be downloaded, the script will abort rather than falling back to password login.*
-```bash
-./init.sh --strict
-```
-
-### 🛠️ Technical Logic
-
-1.  **Dependency Check**: Auto-detects package manager (`apt`, `yum`, `apk`) and installs minimal dependencies (`curl`, `sudo`, `openssh-server`).
+1.  **Dependency Check**: Auto-detects package manager (`apt`, `yum`, `apk`) and installs dependencies (`curl`, `sudo`, `openssh-server`).
 2.  **User Setup**: Creates the specified user (if not root) and grants password-less `sudo` privileges.
-3.  **Key Deployment**: Fetches keys, validates format, fixes `.ssh` permissions (SELinux context safe), and writes to `authorized_keys`.
-4.  **Config Writing**: 
+3.  **Key Deployment**: Deploys SSH public keys, fixes `.ssh` permissions, and supports deduplication.
+4.  **SSH Hardening**:
     * Backs up `sshd_config`.
-    * Removes old script-managed blocks.
-    * Writes a new block at the **beginning** of the file to ensure priority over `Include` directives.
-5.  **Finalization**: Validates config syntax, restarts SSH service, and applies BBR/Updates if requested.
+    * Cleans up old script blocks.
+    * Inserts a new configuration block at the **top** of the file (Disable password, Change port, etc.) to ensure highest priority.
+5.  **Finalization**: Validates config syntax, restarts SSH service, and applies BBR/Updates if selected.
 
 ---
 
