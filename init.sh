@@ -1713,6 +1713,20 @@ enhanced_ssh_test() {
         success=1
         break
       fi
+      # 尝试 1: IPv4 回环 (主流情况)
+      if ssh -o BatchMode=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=no \
+             -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null \
+             -p "$port" "$user@127.0.0.1" "exit 0" >/dev/null 2>&1; then
+           success=1
+           break
+      fi
+      # 尝试 2: IPv6 回环 (针对纯 IPv6 环境的备选)
+      if ssh -o BatchMode=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=no \
+             -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null \
+             -p "$port" "$user@::1" "exit 0" >/dev/null 2>&1; then
+           success=1
+           break
+      fi
     fi
     attempts=$((attempts + 1))
     [ "$attempts" -le "$max_attempts" ] && sleep 1
