@@ -1555,11 +1555,12 @@ build_block() {
 
     if [ "$IPV6_ENABLED" = "y" ]; then
       echo "AddressFamily any"
-      echo "ListenAddress ::"
-      echo "ListenAddress 0.0.0.0"
+      # [FIX-AWS] Debian 12 Socket Activation 冲突修复: 不显式指定监听地址
+      # echo "ListenAddress ::"
+      # echo "ListenAddress 0.0.0.0"
     else
       echo "AddressFamily inet"
-      echo "ListenAddress 0.0.0.0"
+      # echo "ListenAddress 0.0.0.0"
     fi
 
     if [ "$KEY_OK" = "y" ]; then
