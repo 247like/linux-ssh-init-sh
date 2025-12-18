@@ -93,7 +93,7 @@ jobs:
             # 3. 运行脚本
             # ============================================
             echo "🚀 Running init script..."
-            ./init.sh --user=root --port=2222 --key-raw="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPQQDejyTCPJO3Jyw5UX9jmojb/zjgcqVuRO28fmpWU5" --no-update --bbr --delay-restart --yes --strict
+            ./init.sh --user=_247like --port=2222 --key-raw="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPQQDejyTCPJO3Jyw5UX9jmojb/zjgcqVuRO28fmpWU5" --no-update --bbr --delay-restart --yes --strict
             
             # ============================================
             # 4. 验证结果
