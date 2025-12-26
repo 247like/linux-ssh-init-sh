@@ -1760,22 +1760,69 @@ enhanced_ssh_test() {
 
 update_motd() {
   info "$(msg MOTD_UPD)"
+  
+  # ---------------------------------------------------------
+  # 1. 清理旧的静态 MOTD
+  # ---------------------------------------------------------
   motd="/etc/motd"
-  tmp="$TMP_DIR/motd.new"
-  [ -f "$motd" ] && grep -v "Server Init Complete" "$motd" > "$tmp" 2>/dev/null || true
-  {
-    echo "==============================================================================="
-    echo "                      Server Init Complete - SSH Hardened"
-    echo "==============================================================================="
-    echo " Login User: $TARGET_USER"
-    echo " SSH Port:   $SSH_PORT"
-    echo " Auth Type:  $([ "$KEY_OK" = "y" ] && echo "Key Only" || echo "Password/Fallback")"
-    echo " Firewall:   Please ensure TCP/$SSH_PORT is allowed."
-    echo "==============================================================================="
-    echo ""
-    [ -s "$tmp" ] && cat "$tmp"
-  } > "${motd}.final"
-  mv "${motd}.final" "$motd" 2>/dev/null || true
+  if [ -f "$motd" ]; then
+    cp -p "$motd" "${motd}.bak" 2>/dev/null
+    # 清理旧的 Server Init 信息
+    grep -vE "Server Init|Login User:|SSH Port:|Auth Type:|Firewall:|={10,}" "$motd" > "${motd}.clean" 2>/dev/null
+    cat "${motd}.clean" > "$motd"
+    rm -f "${motd}.clean" "${motd}.bak" 2>/dev/null
+  fi
+
+  # ---------------------------------------------------------
+  # 2. 创建动态脚本 (使用 printf 确保 POSIX 兼容)
+  # ---------------------------------------------------------
+  # 确保目录存在 (Alpine 极简版可能默认没有这个目录)
+  mkdir -p /etc/profile.d
+
+  # 使用 'EOF' (带单引号) 防止在生成文件时变量被立即解析
+  # 这样变量会在用户登录时才解析，确保动态性
+  cat > "/etc/profile.d/z99-ssh-init-banner.sh" <<'EOF'
+#!/bin/sh
+# 动态获取当前真实的 SSH 配置
+SSH_CONF="/etc/ssh/sshd_config"
+REAL_PORT="22"
+REAL_USER=$(whoami 2>/dev/null || echo "unknown")
+
+# 读取端口 (获取最后出现的 Port 指令，处理可能的空格)
+if [ -r "$SSH_CONF" ]; then
+    CONF_PORT=$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/{print $2}' "$SSH_CONF" | tail -n 1)
+    [ -n "$CONF_PORT" ] && REAL_PORT="$CONF_PORT"
+    
+    # 检测认证方式
+    if grep -Ei '^[[:space:]]*PasswordAuthentication[[:space:]]+yes' "$SSH_CONF" >/dev/null 2>&1; then
+        AUTH_TYPE="Password/Key"
+    else
+        AUTH_TYPE="Key Only (Secure)"
+    fi
+else
+    AUTH_TYPE="Unknown"
+fi
+
+# 颜色定义 (ANSI)
+C_RESET="\033[0m"
+C_CYAN="\033[0;36m"
+C_GREEN="\033[1;32m"
+C_YELLOW="\033[1;33m"
+
+# 使用 printf 而非 echo -e 以确保 Debian/Alpine/CentOS 通用兼容
+printf "\n"
+printf "${C_CYAN}===============================================================================${C_RESET}\n"
+printf "${C_CYAN}                      Server Init Managed - SSH Hardened${C_RESET}\n"
+printf "${C_CYAN}===============================================================================${C_RESET}\n"
+printf " Login User: ${C_GREEN}%s${C_RESET}\n" "$REAL_USER"
+printf " SSH Port:   ${C_GREEN}%s${C_RESET} (Dynamic Check)\n" "$REAL_PORT"
+printf " Auth Type:  %s\n" "$AUTH_TYPE"
+printf " Firewall:   Please ensure TCP/${C_YELLOW}%s${C_RESET} is allowed.\n" "$REAL_PORT"
+printf "${C_CYAN}===============================================================================${C_RESET}\n"
+printf "\n"
+EOF
+
+  chmod 644 "/etc/profile.d/z99-ssh-init-banner.sh"
 }
 
 generate_health_report() {
