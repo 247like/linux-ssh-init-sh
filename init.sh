@@ -3,6 +3,10 @@
 # linux-ssh-init-sh
 # Server Init & SSH Hardening Script
 #
+# Author:  247like
+# GitHub:  https://github.com/247like/linux-ssh-init-sh
+# License: MIT
+#
 # Release: v4.6.2 (Fortress Pro - Final Audit Fix)
 #
 # POSIX sh compatible (Debian dash / CentOS / Alpine / Ubuntu)
