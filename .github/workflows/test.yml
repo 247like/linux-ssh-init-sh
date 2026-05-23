@@ -1,12 +1,48 @@
 name: Test Matrix
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
 
 jobs:
-  test-distros:
-    # 关键点 1: 在 Ubuntu 宿主机上运行 Job，而不是直接在容器里跑
+  # -------------------------------------------------------------------
+  # 1. POSIX lint with shellcheck — runs once, NOT in matrix.
+  # -------------------------------------------------------------------
+  shellcheck:
+    name: ShellCheck (POSIX sh)
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y shellcheck
+          shellcheck --version
+          # -s sh        : POSIX shell mode (catches bashisms)
+          # SC1091       : "not following sourced file" — script is self-contained
+          # SC2317       : "unreachable" — shellcheck doesn't follow trap callbacks
+          # SC2015       : A && B || C info — used intentionally throughout
+          # SC2012       : ls for parsing — we only use ls -ln to extract uid (POSIX-safe)
+          shellcheck -s sh -e SC1091,SC2317,SC2015,SC2012 init.sh
+
+  # -------------------------------------------------------------------
+  # 2. Per-distro install test with --delay-restart (no live sshd churn)
+  # -------------------------------------------------------------------
+  test-distros:
+    name: Install test (delay-restart) — ${{ matrix.container }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     strategy:
       fail-fast: false
       matrix:
@@ -14,94 +50,559 @@ jobs:
           - 'debian:11'
           - 'debian:12'
           - 'ubuntu:22.04'
+          - 'ubuntu:24.04'
           - 'alpine:latest'
           - 'almalinux:9'
           - 'rockylinux:9'
-          - 'centos:7'                        # 这里的 CentOS 7 现在可以跑了！
           - 'quay.io/centos/centos:stream9'
+        include:
+          # CentOS 7 is EOL (2024-06-30) — kept for legacy users but allowed to fail.
+          - container: 'centos:7'
+            allow_failure: true
+
+    continue-on-error: ${{ matrix.allow_failure == true }}
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Run Test in Container
+      - name: Run init.sh in ${{ matrix.container }}
         run: |
-          echo "🚀 Testing on image: ${{ matrix.container }}"
+          echo "🚀 Testing on: ${{ matrix.container }}"
           chmod +x init.sh
 
-          # 启动容器
-          docker run --rm --privileged -v $(pwd):/mnt -w /mnt ${{ matrix.container }} /bin/sh -c '
-            
-            # 调试信息：打印当前系统版本
-            if [ -f /etc/redhat-release ]; then
-                echo "📝 System detected: $(cat /etc/redhat-release)"
-            fi
+          docker run --rm --privileged -v "$(pwd)":/mnt:ro -w /mnt ${{ matrix.container }} /bin/sh -c '
+            set -e
 
-            # ============================================
-            # 1. 针对 CentOS 7 的“起死回生”补丁 (正则修正版)
-            # ============================================
-            # [FIX] 改为匹配 "release 7"，兼容 "CentOS Linux release 7.x.x"
+            # -----------------------------------------------------------------
+            # CentOS 7 vault patch — only needed because mirror.centos.org is down
+            # -----------------------------------------------------------------
             if [ -f /etc/redhat-release ] && grep -q "release 7" /etc/redhat-release; then
-              echo "💀 Detected CentOS 7 (EOL). Fixing repositories to Vault..."
-              
-              # 暴力替换所有 repo 文件 (base, updates, extras 等)
-              # 1. 注释掉失效的 mirrorlist
+              echo "💀 CentOS 7 (EOL) — repointing repos to vault.centos.org"
               sed -i "s/^mirrorlist/#mirrorlist/g" /etc/yum.repos.d/*.repo
-              
-              # 2. 启用 baseurl 并指向 vault
               sed -i "s|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g" /etc/yum.repos.d/*.repo
               sed -i "s|^baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g" /etc/yum.repos.d/*.repo
-              
-              # 3. 强制清理缓存
               yum clean all
               rm -rf /var/cache/yum
             fi
 
-            # ============================================
-            # 2. 环境补全
-            # ============================================
+            # -----------------------------------------------------------------
+            # Dependencies
+            # -----------------------------------------------------------------
             echo "📦 Installing dependencies..."
-            
-            # --- Debian / Ubuntu ---
             if [ -f /etc/debian_version ]; then
-              apt-get update -y && apt-get install -y curl sudo openssh-server
+              apt-get update -qq && apt-get install -y -qq curl sudo openssh-server iproute2
               ssh-keygen -A
               mkdir -p /run/sshd
-            fi
-
-            # --- Alpine ---
-            if [ -f /etc/alpine-release ]; then
+            elif [ -f /etc/alpine-release ]; then
               apk add --no-cache curl sudo openssh-server bash
               ssh-keygen -A
-            fi
-
-            # --- RHEL / CentOS / Alma / Rocky ---
-            if [ -f /etc/redhat-release ]; then
-              # AlmaLinux 9 解决 curl-minimal 冲突
+            elif [ -f /etc/redhat-release ]; then
               if command -v dnf >/dev/null; then
-                dnf install -y --allowerasing curl sudo openssh-server
+                dnf install -y --allowerasing curl sudo openssh-server iproute
               else
-                # CentOS 7 会走这里，现在源修好了，安装应该没问题
-                yum install -y curl sudo openssh-server
+                yum install -y curl sudo openssh-server iproute
               fi
-              
               ssh-keygen -A
               mkdir -p /run/sshd
             fi
 
-            # ============================================
-            # 3. 运行脚本
-            # ============================================
-            echo "🚀 Running init script..."
-            ./init.sh --user=_247like --port=2222 --key-raw="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPQQDejyTCPJO3Jyw5UX9jmojb/zjgcqVuRO28fmpWU5" --no-update --bbr --delay-restart --yes --strict
-            
-            # ============================================
-            # 4. 验证结果
-            # ============================================
-            if grep -q "BEGIN SERVER-INIT MANAGED BLOCK" /etc/ssh/sshd_config; then
-               echo "✅ SUCCESS: Config block injected."
-            else
-               echo "❌ FAIL: Config block missing."
-               exit 1
+            # -----------------------------------------------------------------
+            # Make /bin/sh point to dash where available so dash-isms surface.
+            # -----------------------------------------------------------------
+            if [ -x /bin/dash ]; then
+              ln -sf /bin/dash /bin/sh
+              echo "ℹ️ /bin/sh now resolves to: $(readlink -f /bin/sh)"
             fi
+
+            # -----------------------------------------------------------------
+            # Run init.sh
+            # -----------------------------------------------------------------
+            echo "🚀 Running init.sh..."
+            cp init.sh /tmp/init.sh
+            chmod +x /tmp/init.sh
+            /tmp/init.sh \
+              --user=_247like \
+              --port=2222 \
+              --key-raw="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPQQDejyTCPJO3Jyw5UX9jmojb/zjgcqVuRO28fmpWU5 ci@test" \
+              --no-update \
+              --bbr \
+              --delay-restart \
+              --no-ip-probe \
+              --yes \
+              --strict
+
+            # -----------------------------------------------------------------
+            # Assertions
+            # -----------------------------------------------------------------
+            echo "🔍 Verifying outcome..."
+
+            grep -q "BEGIN SERVER-INIT MANAGED BLOCK" /etc/ssh/sshd_config \
+              || { echo "❌ managed block missing"; exit 1; }
+
+            grep -Eq "^[[:space:]]*Port[[:space:]]+2222([[:space:]]|$)" /etc/ssh/sshd_config \
+              || { echo "❌ Port 2222 not in config"; exit 1; }
+
+            id _247like >/dev/null \
+              || { echo "❌ user _247like not created"; exit 1; }
+
+            test -s /home/_247like/.ssh/authorized_keys \
+              || { echo "❌ authorized_keys missing or empty"; exit 1; }
+
+            grep -q "ssh-ed25519 AAAA" /home/_247like/.ssh/authorized_keys \
+              || { echo "❌ deployed key content missing"; exit 1; }
+
+            test -f /etc/sudoers.d/server-init-_247like \
+              || { echo "❌ stable sudoers file missing"; exit 1; }
+
+            test -f /etc/profile.d/z99-ssh-init-banner.sh \
+              || { echo "❌ login banner missing"; exit 1; }
+
+            # sshd -t against the rewritten config must pass.
+            sshd -t -f /etc/ssh/sshd_config \
+              || { echo "❌ sshd -t rejected the new config"; exit 1; }
+
+            # Audit log must exist and record the DONE phase.
+            test -f /var/log/server-init-audit.log \
+              || { echo "❌ audit log missing"; exit 1; }
+            grep -q "ACTION: DONE" /var/log/server-init-audit.log \
+              || { echo "❌ audit log missing DONE entry"; exit 1; }
+            # [v4.7.8] Verify the new v4.7.4 audit entries are emitted on the
+            # happy path so silent regressions are caught.
+            grep -q "ACTION: USER_CREATED" /var/log/server-init-audit.log \
+              || { echo "❌ audit log missing USER_CREATED entry"; exit 1; }
+            grep -q "ACTION: KEYS_DEPLOYED" /var/log/server-init-audit.log \
+              || { echo "❌ audit log missing KEYS_DEPLOYED entry"; exit 1; }
+            grep -q "ACTION: PASSWORD_CLEARED" /var/log/server-init-audit.log \
+              || { echo "❌ audit log missing PASSWORD_CLEARED entry"; exit 1; }
+            grep -q "ACTION: MANAGED_BLOCK_INSTALLED" /var/log/server-init-audit.log \
+              || { echo "❌ audit log missing MANAGED_BLOCK_INSTALLED entry"; exit 1; }
+
+            # Health report must exist.
+            test -f /var/log/server-init-health.log \
+              || { echo "❌ health report missing"; exit 1; }
+
+            # Backup directory must have a verifiable restore.sh.
+            backup_dir=$(ls -dt /var/backups/ssh-config/*/ 2>/dev/null | head -n 1)
+            test -n "$backup_dir" \
+              || { echo "❌ backup directory missing"; exit 1; }
+            test -x "$backup_dir/restore.sh" \
+              || { echo "❌ restore.sh missing or not executable"; exit 1; }
+            test -f "$backup_dir/checksums.sha256" \
+              || { echo "❌ checksums.sha256 missing"; exit 1; }
+            ( cd "$backup_dir" && sha256sum -c checksums.sha256 ) \
+              || { echo "❌ backup checksums do not verify"; exit 1; }
+
+            # Re-run idempotency: second invocation must not duplicate the managed block.
+            echo "🔁 Re-running to confirm idempotency..."
+            /tmp/init.sh \
+              --user=_247like \
+              --port=2222 \
+              --key-raw="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPQQDejyTCPJO3Jyw5UX9jmojb/zjgcqVuRO28fmpWU5 ci@test" \
+              --no-update --no-bbr --delay-restart --no-ip-probe --yes --strict
+
+            block_count=$(grep -c "BEGIN SERVER-INIT MANAGED BLOCK" /etc/ssh/sshd_config || true)
+            test "$block_count" = "1" \
+              || { echo "❌ managed block duplicated on re-run (count=$block_count)"; exit 1; }
+
+            sudoers_count=$(ls /etc/sudoers.d/server-init-_247like* 2>/dev/null | wc -l)
+            test "$sudoers_count" = "1" \
+              || { echo "❌ sudoers files multiplied on re-run (count=$sudoers_count)"; exit 1; }
+
+            echo "✅ ALL ASSERTIONS PASSED"
+          '
+
+  # -------------------------------------------------------------------
+  # 3. Live restart + listen + connection test on one representative distro
+  #    Uses the v4.7.1 direct-spawn fallback in restart_sshd, so this works
+  #    in a plain (non-systemd) container.
+  # -------------------------------------------------------------------
+  test-live-restart:
+    name: Live restart & connection (ubuntu:22.04)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Live test
+        run: |
+          chmod +x init.sh
+          docker run --rm --privileged -v "$(pwd)":/mnt:ro -w /mnt ubuntu:22.04 /bin/sh -c '
+            set -e
+            apt-get update -qq
+            apt-get install -y -qq curl sudo openssh-server iproute2 netcat-openbsd procps
+            ssh-keygen -A
+            mkdir -p /run/sshd
+            # Pre-start sshd manually (no systemd in this container).
+            /usr/sbin/sshd
+
+            # Wait for sshd on 22.
+            for i in 1 2 3 4 5; do
+              ss -ltn | grep -q ":22 " && break
+              sleep 1
+            done
+
+            cp init.sh /tmp/init.sh && chmod +x /tmp/init.sh
+            # Live invocation — no --delay-restart. The v4.7.1 direct-spawn
+            # fallback in restart_sshd kicks in because systemd is absent.
+            /tmp/init.sh \
+              --user=_247like \
+              --port=2222 \
+              --key-raw="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPQQDejyTCPJO3Jyw5UX9jmojb/zjgcqVuRO28fmpWU5 ci@test" \
+              --no-update --no-bbr --no-ip-probe --yes --strict
+
+            # After live restart, sshd must be listening on 2222.
+            # Give the freshly-spawned daemon a moment to bind.
+            for i in 1 2 3 4 5; do
+              ss -ltn | grep -q ":2222 " && break
+              sleep 1
+            done
+            ss -ltn | grep -q ":2222 " || { echo "❌ sshd not listening on 2222"; ss -ltn; exit 1; }
+
+            # SSH banner on the new port.
+            banner=$(printf "SSH-2.0-TEST\r\n" | nc -w 3 127.0.0.1 2222 | head -1 || true)
+            echo "Banner: $banner"
+            echo "$banner" | grep -q "SSH-2.0" || { echo "❌ no SSH banner on 2222"; exit 1; }
+
+            echo "✅ Live restart + listen + banner OK"
+          '
+
+  # -------------------------------------------------------------------
+  # 4. Pre-existing-user safety test — ensure passwd -d does NOT clobber an
+  #    existing admin password (the v4.7.0 → v4.7.1 R1 regression test).
+  # -------------------------------------------------------------------
+  test-existing-user-safe:
+    name: Pre-existing user password preserved
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify pre-existing user is left alone
+        run: |
+          chmod +x init.sh
+          docker run --rm --privileged -v "$(pwd)":/mnt:ro -w /mnt ubuntu:22.04 /bin/sh -c '
+            set -e
+            apt-get update -qq
+            apt-get install -y -qq curl sudo openssh-server iproute2
+            ssh-keygen -A
+            mkdir -p /run/sshd
+            if [ -x /bin/dash ]; then ln -sf /bin/dash /bin/sh; fi
+
+            # Create an existing admin with a known password hash.
+            useradd -m -s /bin/bash existing_admin
+            echo "existing_admin:hunter2_super_secret" | chpasswd
+            # Capture the shadow line BEFORE the script runs.
+            shadow_before=$(getent shadow existing_admin | cut -d: -f2)
+            echo "shadow_before: $shadow_before"
+            test -n "$shadow_before" || { echo "no shadow entry"; exit 1; }
+            test "$shadow_before" != "" || { echo "empty shadow"; exit 1; }
+            test "$shadow_before" != "!" || { echo "locked unexpectedly"; exit 1; }
+
+            cp init.sh /tmp/init.sh && chmod +x /tmp/init.sh
+            /tmp/init.sh \
+              --user=existing_admin \
+              --port=2222 \
+              --key-raw="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPQQDejyTCPJO3Jyw5UX9jmojb/zjgcqVuRO28fmpWU5 ci@test" \
+              --no-update --no-bbr --delay-restart --no-ip-probe --yes --strict
+
+            shadow_after=$(getent shadow existing_admin | cut -d: -f2)
+            echo "shadow_after:  $shadow_after"
+            test "$shadow_before" = "$shadow_after" || {
+              echo "❌ REGRESSION: existing_admin password was changed!"
+              echo "    before: $shadow_before"
+              echo "    after:  $shadow_after"
+              exit 1
+            }
+
+            # [v4.7.3] Positive assertion: passwd -S should report `P` (password
+            # set) — not `NP` (no password) or `L` (locked).
+            ps_out=$(passwd -S existing_admin 2>/dev/null || true)
+            echo "passwd -S: $ps_out"
+            echo "$ps_out" | awk "{print \$2}" | grep -qE "^P\$" || {
+              echo "❌ REGRESSION: existing_admin lost its password set state (expected P, got: $ps_out)"
+              exit 1
+            }
+
+            # [v4.7.2] safe_configure_sudo is only invoked from the
+            # new-user branch of safe_ensure_user. For PRE-EXISTING accounts,
+            # safe_ensure_user returns early and never touches sudoers. The
+            # absence of the sudoers file is the correct, expected behavior.
+            if [ -f /etc/sudoers.d/server-init-existing_admin ]; then
+              echo "❌ REGRESSION: script wrote sudoers for a pre-existing account"
+              exit 1
+            fi
+            echo "✅ Pre-existing user password preserved and sudoers untouched"
+          '
+
+  # -------------------------------------------------------------------
+  # 5. Cross-user sudoers cleanup safety — verify the legacy-glob cleanup
+  #    cannot delete another user'\''s stable sudoers file when usernames
+  #    share a hyphen-prefix (e.g. running script for "admin" must not
+  #    remove "/etc/sudoers.d/server-init-admin-bot").
+  # -------------------------------------------------------------------
+  test-cross-user-sudoers-safe:
+    name: Cross-user sudoers cleanup glob safety
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify glob does not match sibling usernames
+        run: |
+          chmod +x init.sh
+          docker run --rm --privileged -v "$(pwd)":/mnt:ro -w /mnt ubuntu:22.04 /bin/sh -c '
+            set -e
+            apt-get update -qq
+            apt-get install -y -qq curl sudo openssh-server iproute2
+            ssh-keygen -A
+            mkdir -p /run/sshd
+
+            # Pre-create a sibling user with a HYPHENATED name that shares a
+            # prefix with the script target. Also create an operator-managed
+            # sudoers file with a non-numeric suffix. The seed content uses a
+            # Defaults-only line (NOT a user/group rule) so it does NOT match
+            # safe_configure_sudo's principal-prefix check `^[[:space:]]*admin
+            # [[:space:]]` — otherwise the script would believe `admin` already
+            # has sudo and would NOT write the new stable file, breaking the
+            # third assertion below.
+            useradd -m admin-bot
+            mkdir -p /etc/sudoers.d
+            echo "admin-bot ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/server-init-admin-bot
+            chmod 440 /etc/sudoers.d/server-init-admin-bot
+            # Operator-managed file: Defaults block, no user/group rule that
+            # could match the "admin" principal regex in safe_configure_sudo.
+            # NOTE: cannot use printf with single-quoted format because the
+            # outer `sh -c '\''...'\''` wrap would terminate at any internal
+            # single quote — use double quotes with escaped inner quotes.
+            printf "%s\n" "Defaults env_keep += \"PROXY_URL\"" > /etc/sudoers.d/server-init-admin-special-policy
+            chmod 440 /etc/sudoers.d/server-init-admin-special-policy
+
+            cp init.sh /tmp/init.sh && chmod +x /tmp/init.sh
+
+            # Run for user "admin" — the legacy-cleanup glob would naively
+            # match server-init-admin-* including admin-bot (HIGH bug fixed in
+            # v4.7.2 by requiring digits-only suffix).
+            /tmp/init.sh \
+              --user=admin \
+              --port=2222 \
+              --key-raw="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPQQDejyTCPJO3Jyw5UX9jmojb/zjgcqVuRO28fmpWU5 ci@test" \
+              --no-update --no-bbr --delay-restart --no-ip-probe --yes --strict
+
+            # Sibling sudoers MUST survive.
+            test -f /etc/sudoers.d/server-init-admin-bot \
+              || { echo "❌ REGRESSION: sibling stable sudoers file was deleted"; ls /etc/sudoers.d/; exit 1; }
+            # Operator-managed non-numeric-suffix file MUST survive.
+            test -f /etc/sudoers.d/server-init-admin-special-policy \
+              || { echo "❌ REGRESSION: operator-managed sudoers file was deleted"; ls /etc/sudoers.d/; exit 1; }
+            # New stable file for admin SHOULD exist.
+            test -f /etc/sudoers.d/server-init-admin \
+              || { echo "❌ admin stable sudoers missing"; ls /etc/sudoers.d/; exit 1; }
+
+            echo "✅ Cross-user sudoers glob safety + operator-file safety verified"
+          '
+
+  # -------------------------------------------------------------------
+  # 6. Legacy v4.6.x timestamped sudoers SHOULD be cleaned on re-run.
+  # -------------------------------------------------------------------
+  test-legacy-sudoers-cleanup:
+    name: Legacy timestamped sudoers auto-cleanup
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify legacy-pattern file is removed
+        run: |
+          chmod +x init.sh
+          docker run --rm --privileged -v "$(pwd)":/mnt:ro -w /mnt ubuntu:22.04 /bin/sh -c '
+            set -e
+            apt-get update -qq
+            apt-get install -y -qq curl sudo openssh-server iproute2
+            ssh-keygen -A
+            mkdir -p /run/sshd
+
+            # Simulate a v4.6.x leftover for user "deploy".
+            mkdir -p /etc/sudoers.d
+            echo "deploy ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/server-init-deploy-20250520123045
+            chmod 440 /etc/sudoers.d/server-init-deploy-20250520123045
+            ls -l /etc/sudoers.d/
+
+            cp init.sh /tmp/init.sh && chmod +x /tmp/init.sh
+            /tmp/init.sh \
+              --user=deploy \
+              --port=2222 \
+              --key-raw="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPQQDejyTCPJO3Jyw5UX9jmojb/zjgcqVuRO28fmpWU5 ci@test" \
+              --no-update --no-bbr --delay-restart --no-ip-probe --yes --strict
+
+            # Legacy file must be gone.
+            test ! -f /etc/sudoers.d/server-init-deploy-20250520123045 \
+              || { echo "❌ legacy timestamped sudoers was NOT cleaned"; ls -l /etc/sudoers.d/; exit 1; }
+            # Stable file must exist.
+            test -f /etc/sudoers.d/server-init-deploy \
+              || { echo "❌ stable sudoers missing"; ls -l /etc/sudoers.d/; exit 1; }
+            # Audit log must record the removal.
+            grep -q "ACTION: LEGACY_SUDOERS_REMOVED" /var/log/server-init-audit.log \
+              || { echo "❌ audit log missing LEGACY_SUDOERS_REMOVED entry"; exit 1; }
+            grep -q "server-init-deploy-20250520123045" /var/log/server-init-audit.log \
+              || { echo "❌ audit log missing specific path"; exit 1; }
+
+            echo "✅ Legacy sudoers cleanup verified"
+          '
+
+  # -------------------------------------------------------------------
+  # 7. CLI flag smoke — --version / --help / --no-ip-probe
+  # -------------------------------------------------------------------
+  test-cli-flags:
+    name: CLI flag smoke (--version / --help / --no-ip-probe)
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - name: Smoke-test CLI flags
+        run: |
+          chmod +x init.sh
+          docker run --rm -v "$(pwd)":/mnt:ro -w /mnt ubuntu:22.04 /bin/sh -c '
+            set -e
+            # We need root for the script to run past the preflight check.
+            # --version / --help exit BEFORE the root check, so they work
+            # for any user.
+
+            # --version
+            ver=$(./init.sh --version)
+            echo "version: $ver"
+            echo "$ver" | grep -q "v4.7.8" \
+              || { echo "❌ --version did not report v4.7.8: $ver"; exit 1; }
+
+            # --help should list all known flags
+            ./init.sh --help | grep -q -- "--no-ip-probe" \
+              || { echo "❌ --help missing --no-ip-probe entry"; exit 1; }
+            ./init.sh --help | grep -q -- "--strict" \
+              || { echo "❌ --help missing --strict entry"; exit 1; }
+
+            # Short forms
+            ./init.sh -V | grep -q "v4.7.8" \
+              || { echo "❌ -V failed"; exit 1; }
+            ./init.sh -h | grep -q -- "--help" \
+              || { echo "❌ -h failed"; exit 1; }
+
+            echo "✅ CLI flag smoke OK"
+          '
+
+  # -------------------------------------------------------------------
+  # 8. --no-ip-probe actually skips the ipify lookup
+  # -------------------------------------------------------------------
+  test-no-ip-probe:
+    name: --no-ip-probe skips external IP lookup
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify --no-ip-probe skips ipify call
+        run: |
+          chmod +x init.sh
+          docker run --rm --privileged -v "$(pwd)":/mnt:ro -w /mnt ubuntu:22.04 /bin/sh -c '
+            set -e
+            apt-get update -qq
+            apt-get install -y -qq curl sudo openssh-server iproute2
+            ssh-keygen -A
+            mkdir -p /run/sshd
+
+            cp init.sh /tmp/init.sh && chmod +x /tmp/init.sh
+            /tmp/init.sh \
+              --user=deploy \
+              --port=2222 \
+              --key-raw="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPQQDejyTCPJO3Jyw5UX9jmojb/zjgcqVuRO28fmpWU5 ci@test" \
+              --no-update --no-bbr --delay-restart --no-ip-probe --yes --strict
+
+            # Log should NOT contain ipify lookup.
+            if grep -q "api.ipify.org" /var/log/server-init.log 2>/dev/null; then
+              echo "❌ --no-ip-probe failed: ipify URL leaked into log"
+              grep "api.ipify.org" /var/log/server-init.log
+              exit 1
+            fi
+
+            echo "✅ --no-ip-probe verified"
+          '
+
+  # -------------------------------------------------------------------
+  # 9. ACCOUNT_LOCKED warning fires when key deployment fails (non-strict)
+  # -------------------------------------------------------------------
+  test-account-locked-path:
+    name: ACCOUNT_LOCKED fires when key deploy fails (non-strict)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify ACCOUNT_LOCKED_REASON path
+        run: |
+          chmod +x init.sh
+          docker run --rm --privileged -v "$(pwd)":/mnt:ro -w /mnt ubuntu:22.04 /bin/sh -c '
+            set -e
+            apt-get update -qq
+            apt-get install -y -qq curl sudo openssh-server iproute2
+            ssh-keygen -A
+            mkdir -p /run/sshd
+
+            cp init.sh /tmp/init.sh && chmod +x /tmp/init.sh
+            # Deliberately use an unreachable URL so key deploy FAILS but in
+            # non-strict mode the script continues.
+            /tmp/init.sh \
+              --user=deploy_locked \
+              --port=2222 \
+              --key-url="https://127.0.0.1:1/nope" \
+              --no-update --no-bbr --delay-restart --no-ip-probe --yes \
+              || { echo "non-strict run should not exit non-zero on key deploy failure"; exit 1; }
+
+            # Audit log should record the locked state.
+            grep -q "ACTION: ACCOUNT_KEPT_LOCKED" /var/log/server-init-audit.log \
+              || { echo "❌ audit missing ACCOUNT_KEPT_LOCKED"; cat /var/log/server-init-audit.log; exit 1; }
+
+            # User should exist but be locked.
+            passwd -S deploy_locked | awk "{print \$2}" | grep -qE "^L\$|^LK\$" \
+              || { echo "❌ deploy_locked is not locked"; passwd -S deploy_locked; exit 1; }
+
+            echo "✅ ACCOUNT_LOCKED path verified"
+          '
+
+  # -------------------------------------------------------------------
+  # 10. restore.sh refuses when checksums.sha256 is missing; FORCE=1 overrides
+  # -------------------------------------------------------------------
+  test-restore-checksum-gate:
+    name: restore.sh refuses missing checksums; FORCE=1 overrides
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify checksum gate + FORCE=1
+        run: |
+          chmod +x init.sh
+          docker run --rm --privileged -v "$(pwd)":/mnt:ro -w /mnt ubuntu:22.04 /bin/sh -c '
+            set -e
+            apt-get update -qq
+            apt-get install -y -qq curl sudo openssh-server iproute2
+            ssh-keygen -A
+            mkdir -p /run/sshd
+
+            cp init.sh /tmp/init.sh && chmod +x /tmp/init.sh
+            /tmp/init.sh \
+              --user=deploy \
+              --port=2222 \
+              --key-raw="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPQQDejyTCPJO3Jyw5UX9jmojb/zjgcqVuRO28fmpWU5 ci@test" \
+              --no-update --no-bbr --delay-restart --no-ip-probe --yes --strict
+
+            backup_dir=$(ls -dt /var/backups/ssh-config/*/ 2>/dev/null | head -n 1)
+            test -n "$backup_dir" || { echo "❌ no backup dir"; exit 1; }
+            test -x "$backup_dir/restore.sh" || { echo "❌ no restore.sh"; exit 1; }
+
+            # 1. Delete checksum file → restore.sh should REFUSE.
+            rm -f "$backup_dir/checksums.sha256"
+            if sh "$backup_dir/restore.sh" 2>&1; then
+              echo "❌ restore.sh did NOT refuse when checksums.sha256 was missing"
+              exit 1
+            fi
+            echo "✅ restore.sh refused missing checksums"
+
+            # 2. FORCE=1 should bypass.
+            if ! FORCE=1 sh "$backup_dir/restore.sh" 2>&1; then
+              echo "❌ FORCE=1 did NOT bypass the checksum gate"
+              exit 1
+            fi
+            echo "✅ FORCE=1 successfully bypassed"
           '

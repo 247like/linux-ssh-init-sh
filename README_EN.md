@@ -36,6 +36,8 @@ Run the following command as **root**.
 curl -fsSL https://raw.githubusercontent.com/247like/linux-ssh-init-sh/main/init.sh -o init.sh && chmod +x init.sh && ./init.sh
 ```
 
+> 🛡️ **Audit tip**: this script modifies SSH config — prefer the "download then run" form above so you can inspect `init.sh` before executing. Avoid `curl … | sh`.
+
 #### 2. Force English UI
 ```bash
 ./init.sh --lang=en
@@ -76,6 +78,9 @@ The script supports rich command-line arguments to control its behavior:
 | | `--yes` | **Auto Confirm**: Skip the final "Proceed?" prompt |
 | | `--strict` | **Strict Mode**: Exit immediately on error (see below) |
 | | `--delay-restart` | **Delay Restart**: Apply config but do not restart SSHD immediately |
+| | `--no-ip-probe` | Skip the external IP lookup (`api.ipify.org`) — for offline/air-gapped hosts |
+| | `-V / --version` | Print version and exit |
+| | `-h / --help` | Show full help |
 | **User/Port** | `--user=root` | Specify login user (root or username) |
 | | `--port=22` | Keep default port 22 |
 | | `--port=random` | Generate random high port (49152-65535) |
@@ -93,15 +98,97 @@ The script supports rich command-line arguments to control its behavior:
 | Feature | Normal Mode (Default) | Strict Mode (`--strict`) |
 | :--- | :--- | :--- |
 | **Philosophy** | **"Don't Lockout"** (Best Effort) | **"Compliance First"** (Zero Tolerance) |
-| **Key Failure** | If key download fails, script **keeps Password Auth enabled** and warns you.<br>👉 *Result: Server reachable but less secure.* | Script **exits immediately**. No changes applied.<br>👉 *Result: Deployment aborted, state unchanged.* |
-| **Port Failure** | If random port fails, it falls back to **Port 22**. | Script **exits immediately**. |
+| **Key Failure** | Password auth remains enabled with a warning, and any newly-created user **stays locked** (v4.7.0+).<br>👉 *Existing root/password users can still log in to repair; the new account never becomes passwordless+open.* | Script **exits immediately**. |
+| **Existing-user password** | v4.7.1+: the script **does NOT clear** an existing user's password; `passwd -d` runs only for accounts newly created in this run | Same |
+| **Port Failure** | Falls back to **port 22**. | Script **exits immediately**. |
+| **HTTP key URL** | Warn-and-continue | Reject `http://`, require `https://` |
+| **Firewall rule add failed** | Warn only | Warn + log (non-22 ports) |
+
+### 📦 Requirements
+
+* **Privileges**: must run as `root`
+* **Mandatory commands**: `cat / grep / awk / sed / cp / mv / chmod / chown / mkdir / rm / id`
+* **Recommended commands** (auto-installed if missing): `curl` or `wget`, `sudo`, `openssh-server`, `ss` or `netstat`, `nc`, `base64`, `ssh-keygen`
+* **Verified distros** (full CI matrix):
+  * Debian 11 / 12
+  * Ubuntu 22.04 / 24.04
+  * Alpine (latest)
+  * AlmaLinux 9 / Rocky Linux 9 / CentOS Stream 9
+  * CentOS 7 (EOL — best effort, allow-failure in CI)
+
+### 📁 Files the script creates / modifies
+
+| Path | Purpose |
+| :--- | :--- |
+| `/etc/ssh/sshd_config` | Managed block injected; conflicting drop-ins renamed `*.bak_server_init` |
+| `/etc/ssh/sshd_config.d/*.conf` | Conflicting drop-ins backed up/disabled |
+| `/etc/sudoers.d/server-init-<user>` | Stable filename (v4.7.0+) — delete to revoke |
+| `/etc/systemd/system/sshd.service.d/override.conf` | Anti-kill / restart policy |
+| `/etc/profile.d/z99-ssh-init-banner.sh` | Login banner |
+| `/etc/motd` + `/etc/motd.bak` | Strips stale server-init lines; first run preserves real `.bak` |
+| `/etc/sysctl.conf` | BBR lines appended when `--bbr` is enabled |
+| **Firewall rules** (ufw/firewalld/iptables/ip6tables) | Opens TCP port when `--port != 22`; rollback only undoes the backend the script used |
+| **SELinux port labels** | When system is Enforcing, applies `semanage port -a -t ssh_port_t`; `-m` (modify) path cannot be cleanly rolled back |
+| `/home/<user>/.ssh/authorized_keys` | Deployed keys; symlinks rejected; home owner verified (v4.7.3) |
+| `/var/log/server-init.log` | Runtime log |
+| `/var/log/server-init-audit.log` | Audit trail (redacts `--key-raw` / `--key-url`) |
+| `/var/log/server-init-health.log` | Post-run snapshot |
+| `/var/backups/ssh-config/<TS>/` | Persistent backup + `restore.sh` + `checksums.sha256` |
+| `/var/lib/server-init/last-applied` | (v4.7.3+) records the previous successful port + firewall backend; v4.7.4 also records `SELINUX_PORT=N` so port-change runs clean the prior SELinux label; v4.7.5 adds `SELINUX_OWNED=y/n` distinguishing "label this script installed" from "label that pre-existed" — only the former is cleaned across runs |
+| `/run/server-init/script.lock/` or `/var/lib/server-init/script.lock/` | (v4.7.6+) Script-level mutex directory (holds PID file). Auto-removed on normal exit; if the script was `kill -9`'d the dir may linger — the next start auto-detects whether the holder PID is still alive and reclaims if not |
+| `/run/server-init/last-artifacts-<UID>` or `/var/lib/server-init/last-artifacts-<UID>` | (v4.7.6+) Artifact mirror appended during run; cleared on normal exit. If the script crashed, the next start surfaces this list to alert the operator to stranded mutations |
+
+### 🔁 Idempotency / re-runs
+
+* The managed block is **removed and re-inserted** on every run — no duplicate stacking
+* Sudoers file uses a stable per-user name; re-runs overwrite instead of accumulating
+* **Upgrading from < v4.7.0**: older versions left timestamped sudoers files (`server-init-<user>-YYYYMMDD...`). v4.7.1 added auto-cleanup on the next run; **v4.7.2 narrows the match to digits-only suffixes** so admin-created files like `server-init-<user>-special-policy` are preserved and sibling accounts that share a hyphen-prefix (e.g. `admin` vs `admin-bot`) cannot be collaterally cleaned. Each removal is recorded in audit log as `LEGACY_SUDOERS_REMOVED`
+* Backups rotate by timestamp; the **10 most recent** are retained, older ones pruned automatically
+
+### 🚪 Exit codes
+
+| Code | Meaning |
+| :---: | :--- |
+| 0 | Success |
+| 1 | Generic error / user cancel / config failure |
+| 130 | `SIGINT` (Ctrl-C) |
+| 143 | `SIGTERM` |
+| 129 | `SIGHUP` |
+| ≠ 0 (mid-deploy) | Triggers automatic rollback — inspect `/var/log/server-init.log` + `audit.log` |
+
+> Note: Ctrl-C during the **confirmation prompt** does NOT enter the rollback path (no destructive changes have happened yet).
 
 ### 📂 Logs & Audit
 
 After execution, the following files are generated for troubleshooting and auditing:
 
+> 📋 **Log-rotation recommendation**: the three log files below are append-only with no built-in rotation. For frequent runs (CI / fleet installs) drop in a logrotate config:
+> ```
+> # /etc/logrotate.d/server-init
+> /var/log/server-init*.log {
+>     weekly
+>     rotate 12
+>     compress
+>     delaycompress
+>     missingok
+>     notifempty
+>     create 0600 root root
+> }
+> ```
+
 * **Run Log**: `/var/log/server-init.log` (Detailed debug information)
 * **Audit Log**: `/var/log/server-init-audit.log` (Records key actions, timestamps, and operators)
+  * Action categories (**recommended-to-alert in bold**):
+    * **Lifecycle**: `START` / `DONE` / **`ROLLBACK`** / **`RESTART_REFUSED`**
+    * **Accounts**: `USER_CREATED` / `PASSWORD_CLEARED` / `KEYS_DEPLOYED` / **`ACCOUNT_KEPT_LOCKED`** / **`USER_REMOVE_FAILED`**
+    * **Sudo**: `SUDOERS_WRITTEN` / **`SUDO_FAIL`** / `LEGACY_SUDOERS_REMOVED`
+    * **System config**: `MANAGED_BLOCK_INSTALLED` / `DROPIN_RENAMED` / `SYSTEMD_OVERRIDE_WRITTEN` / `MOTD_BANNER_WRITTEN` / `BBR_ENABLED` / `SYSTEM_UPDATE_START` / `SYSTEM_UPDATE_DONE`
+    * **Firewall**: `FIREWALL_OPENED` / `FIREWALL_NOOP` / `STALE_FIREWALL_REMOVED` / `LAST_APPLIED_CLEARED`
+    * **SELinux**: `SELINUX_PORT_ADDED` / `SELINUX_PORT_NOOP` / `SELINUX_PORT_MODIFIED` / **`SELINUX_PORT_FAIL`** / `STALE_SELINUX_REMOVED` / **`STALE_SELINUX_REMOVE_FAILED`** / `STALE_SELINUX_KEPT` / `STALE_SELINUX_SKIP`
+    * **Incomplete-rollback alerts** (high-priority): **`ROLLBACK_RM_FAILED`** / **`ROLLBACK_MOTD_FAILED`** / **`ROLLBACK_MOTD_BAK_MISSING`** / **`STRANDED_MUTATIONS_DETECTED`**
+    * **Test / security**: `LOGIN_TEST_PASSED` / `LOGIN_TEST_INCONCLUSIVE` / `INSECURE_KEY_URL` / `KEY_FETCH_FAILED` / `DIRECT_SPAWN` / `DIRECT_SPAWN_REFUSED`
+  * Stderr fallback format (when `/var/log` is unwritable): `AUDIT-FALLBACK <timestamp> ACTION=<name> DETAILS=<...>`
+  * Designed for SIEM ingestion
 * **Health Report**: `/var/log/server-init-health.log` (Snapshot of the final system configuration state)
 
 ### 🆘 Disaster Recovery & Restore
@@ -112,7 +199,7 @@ If you cannot connect to your server via SSH after the script finishes (after se
 
 #### Method A: One-Click Restore Script (Recommended)
 
-The script automatically creates a backup and generates a restore script before applying changes.
+Each run creates a backup with a **SHA256 checksums file**. `restore.sh` verifies `checksums.sha256` before applying anything — a tampered backup is rejected.
 
 1.  Find the latest backup directory:
     ```bash
@@ -120,23 +207,31 @@ The script automatically creates a backup and generates a restore script before 
     ```
 2.  Enter the directory and run the restore script:
     ```bash
-    # Enter the latest timestamp directory (e.g., 20250520_120000)
     cd /var/backups/ssh-config/<TIMESTAMP>/
-    
-    # Run the restore script
     sh restore.sh
     ```
-    *This will automatically overwrite `sshd_config` and attempt to restart the SSH service.*
+    `restore.sh` will: ① verify checksums → ② restore `sshd_config` + `sshd_config.d/` → ③ run `sshd -t` → ④ restart sshd. Any failure aborts with a non-zero exit code.
+
+    **Override**: if `checksums.sha256` is missing or `sha256sum` is unavailable, `restore.sh` **REFUSES** to run (defends against restoring a tampered backup). If you're certain the backup is good and need to bypass:
+    ```bash
+    FORCE=1 sh restore.sh
+    ```
+    Use only when you **trust the backup contents** (e.g. you manually pruned `checksums.sha256` yourself).
+
+> ⚠ `restore.sh` only restores **`sshd_config` and its drop-ins**. Users / sudoers / systemd overrides / firewall rules created during the run are best undone by the **runtime auto-rollback** (which fires on any failure during the script run); see the "Files the script creates / modifies" table above for manual cleanup.
 
 #### Method B: Manual Restore
 
-If the restore script is unavailable, manually copy the files:
+If `restore.sh` is unavailable, copy files by hand:
 
 ```bash
-# 1. Overwrite configuration
+# 1. Verify (recommended)
+cd /var/backups/ssh-config/<TIMESTAMP>/ && sha256sum -c checksums.sha256
+
+# 2. Overwrite configuration
 cp /var/backups/ssh-config/<TIMESTAMP>/sshd_config /etc/ssh/sshd_config
 
-# 2. Restart Service
+# 3. Restart service
 systemctl restart sshd || service sshd restart
 ```
 
