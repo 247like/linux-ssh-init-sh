@@ -306,6 +306,73 @@ export LC_ALL LANGUAGE
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
+print_usage() {
+  cat <<EOF
+linux-ssh-init-sh v4.7.8 — Server Init & SSH Hardening
+
+USAGE:
+  ./init.sh [OPTIONS]
+
+CONTROL:
+  --lang=zh|en          Force locale (default: zh)
+  --yes                 Skip the final "proceed?" prompt
+  --strict              Abort on any critical failure (no fallback)
+  --delay-restart       Write config but do not restart sshd / run tests
+  --no-ip-probe         Skip public IP lookup (offline-friendly)
+  -V, --version         Print version and exit
+  -h, --help            This help
+
+USER & PORT:
+  --user=NAME           Login user (default: deploy; "root" allowed)
+  --port=22|random|N    SSH port (random uses 49152-65535)
+
+KEY SOURCE (pick one):
+  --key-gh=USERNAME     Pull from https://github.com/USERNAME.keys
+  --key-url=URL         Fetch from URL (https://; http:// only outside strict)
+  --key-raw="ssh-..."   Inline key(s); use literal \\n between multiple lines
+
+SYSTEM:
+  --update / --no-update    Upgrade installed packages
+  --bbr    / --no-bbr       Enable TCP BBR congestion control
+
+LOGS:
+  /var/log/server-init.log         (debug log)
+  /var/log/server-init-audit.log   (audit trail)
+  /var/log/server-init-health.log  (post-run snapshot)
+  /var/backups/ssh-config/<TS>/    (restore.sh per-run)
+EOF
+}
+
+# --help / --version should not require root and should not acquire locks.
+for __early_arg in "$@"; do
+  case "$__early_arg" in
+    --version|-V)
+      echo "linux-ssh-init-sh v4.7.8 Enterprise Hardening"
+      exit 0 ;;
+    --help|-h)
+      print_usage
+      exit 0 ;;
+  esac
+done
+unset __early_arg
+
+if [ "$(id -u)" -ne 0 ]; then
+  __early_lang="zh"
+  for __early_arg in "$@"; do
+    case "$__early_arg" in
+      --lang=en) __early_lang="en" ;;
+      --lang=zh) __early_lang="zh" ;;
+    esac
+  done
+  if [ "$__early_lang" = "en" ]; then
+    echo "Must be run as root"
+  else
+    echo "必须以 root 权限运行此脚本"
+  fi
+  exit 1
+fi
+unset __early_lang __early_arg
+
 SCRIPT_START_TIME=$(date +%s)
 
 # ---------------- Configuration ----------------
@@ -437,6 +504,23 @@ else
       exit 1 ;;
   esac
 fi
+
+# [v4.7.8 FIX] The script-level mutex is acquired before argv parsing so
+# concurrent invocations are blocked early. That also means every pre-rollback
+# exit path (--help/--version, bad flags, root/preflight/input failures) must
+# release it. Once setup_rollback() installs the real rollback trap, this
+# lightweight cleanup trap is replaced.
+early_cleanup_before_rollback() {
+  [ -n "${STATE_FILE:-}" ] && rm -f "$STATE_FILE" 2>/dev/null || true
+  [ -n "${ARTIFACT_MIRROR:-}" ] && rm -f "$ARTIFACT_MIRROR" 2>/dev/null || true
+  [ -n "${LOCK_DIR:-}" ] && [ -d "$LOCK_DIR" ] && rm -rf "$LOCK_DIR" 2>/dev/null || true
+  [ -n "${SCRIPT_LOCK_DIR:-}" ] && [ -d "$SCRIPT_LOCK_DIR" ] && rm -rf "$SCRIPT_LOCK_DIR" 2>/dev/null || true
+  [ -n "${TMP_DIR:-}" ] && [ -d "$TMP_DIR" ] && rm -rf "$TMP_DIR" 2>/dev/null || true
+  case "${RUNTIME_DIR:-}" in
+    /tmp/*) [ -d "$RUNTIME_DIR" ] && rm -rf "$RUNTIME_DIR" 2>/dev/null || true ;;
+  esac
+}
+trap 'early_cleanup_before_rollback' EXIT
 
 # Colors
 RED='\033[0;31m'
@@ -2342,11 +2426,12 @@ is_port_free() {
 
   if command -v ss >/dev/null 2>&1; then
     if ss -lnt 2>/dev/null | awk -v port="$p" '
+      BEGIN { found = 0 }
       NR > 1 {
         n = split($4, parts, ":")
-        if (parts[n] == port) { exit 0 }
+        if (parts[n] == port) { found = 1; exit }
       }
-      END { exit 1 }
+      END { exit !found }
     '; then
       return 1
     fi
@@ -2355,11 +2440,12 @@ is_port_free() {
 
   if command -v netstat >/dev/null 2>&1; then
     if netstat -lnt 2>/dev/null | awk -v port="$p" '
+      BEGIN { found = 0 }
       NR > 2 {
         n = split($4, parts, ":")
-        if (parts[n] == port) { exit 0 }
+        if (parts[n] == port) { found = 1; exit }
       }
-      END { exit 1 }
+      END { exit !found }
     '; then
       return 1
     fi
@@ -2725,6 +2811,14 @@ finalize_user_password_policy() {
   if passwd -d "$user" >/dev/null 2>&1; then
     info "Account $user: password cleared (key-only auth)"
     audit_log "PASSWORD_CLEARED" "user=$user method=passwd_-d"
+  elif command -v usermod >/dev/null 2>&1 && usermod -p "" "$user" >/dev/null 2>&1; then
+    # Some minimal RHEL-family images ship shadow-utils (useradd/usermod) but
+    # not the separate passwd(1) package. `usermod -U` refuses to unlock an
+    # account when that would leave an empty password, while `passwd -d` would
+    # intentionally create exactly that key-only state. Use usermod -p "" as
+    # the equivalent fallback after key deployment and sudo setup succeeded.
+    info "Account $user: password cleared via usermod -p (key-only auth)"
+    audit_log "PASSWORD_CLEARED" "user=$user method=usermod_-p_empty"
   elif usermod -U "$user" >/dev/null 2>&1; then
     info "Account $user: unlocked via usermod"
     audit_log "PASSWORD_CLEARED" "user=$user method=usermod_-U"
@@ -3060,7 +3154,17 @@ cleanup_sshd_config_d() {
     for conf in "$SSH_CONF_D"/*.conf; do
       [ -f "$conf" ] || continue
       # [SEC-FIX] Case-insensitive matching
-      if awk '{line=tolower($0)} line ~ /^[[:space:]]*(port|permitrootlogin|passwordauthentication|pubkeyauthentication|challengeresponseauthentication|kbdinteractiveauthentication|kexalgorithms|ciphers|macs|addressfamily|listenaddress)[[:space:]]/ {exit 0} END{exit 1}' "$conf" 2>/dev/null; then
+      if awk '
+        BEGIN { found = 0 }
+        {
+          line = tolower($0)
+          if (line ~ /^[[:space:]]*(port|permitrootlogin|passwordauthentication|pubkeyauthentication|challengeresponseauthentication|kbdinteractiveauthentication|kexalgorithms|ciphers|macs|addressfamily|listenaddress)[[:space:]]/) {
+            found = 1
+            exit
+          }
+        }
+        END { exit !found }
+      ' "$conf" 2>/dev/null; then
         # [v4.7.3 FIX-H4] If a stale .bak_server_init from a prior crashed
         # run already exists, do NOT overwrite it (we'd lose the original
         # snapshot). Pick a timestamped name so both are preserved.
@@ -3320,18 +3424,10 @@ install_managed_block() {
   match_line=$(awk '/^[[:space:]]*#/ {next} /^[[:space:]]*Match[[:space:]]/ {print NR; exit}' "$SSH_CONF" 2>/dev/null)
 
   if [ -z "$match_line" ]; then
-    cat "$SSH_CONF" "$block" > "$tmp"
+    cat "$block" "$SSH_CONF" > "$tmp"
   else
     info "$(msg INFO_MATCH_INSERT)"
-    awk -v ml="$match_line" -v bf="$block" '
-      NR < ml { print }
-      NR == ml {
-        while ((getline line < bf) > 0) print line
-        close(bf)
-        print
-      }
-      NR > ml { print }
-    ' "$SSH_CONF" > "$tmp"
+    cat "$block" "$SSH_CONF" > "$tmp"
   fi
 
   chmod 600 "$tmp" 2>/dev/null || true
@@ -3727,11 +3823,11 @@ validate_ssh_config_comprehensive() {
   fi
 
   insecure_options=0
-  if printf '%s\n' "$sshd_T_out" | awk 'tolower($1)=="x11forwarding" && tolower($2)=="yes" {exit 0} END {exit 1}' 2>/dev/null; then
+  if printf '%s\n' "$sshd_T_out" | awk 'BEGIN { found = 0 } tolower($1)=="x11forwarding" && tolower($2)=="yes" { found = 1; exit } END { exit !found }' 2>/dev/null; then
     warn "$(msg WARN_X11_FORWARDING)"
     insecure_options=$((insecure_options + 1))
   fi
-  if printf '%s\n' "$sshd_T_out" | awk 'tolower($1)=="permitemptypasswords" && tolower($2)=="yes" {exit 0} END {exit 1}' 2>/dev/null; then
+  if printf '%s\n' "$sshd_T_out" | awk 'BEGIN { found = 0 } tolower($1)=="permitemptypasswords" && tolower($2)=="yes" { found = 1; exit } END { exit !found }' 2>/dev/null; then
     warn "$(msg WARN_EMPTY_PASSWORDS)"
     insecure_options=$((insecure_options + 1))
   fi
