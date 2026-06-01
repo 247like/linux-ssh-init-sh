@@ -70,7 +70,7 @@ jobs:
           echo "🚀 Testing on: ${{ matrix.container }}"
           chmod +x init.sh
 
-          docker run --rm --privileged -v "$(pwd)":/mnt:ro -w /mnt ${{ matrix.container }} /bin/sh -c '
+          docker run --rm --privileged -v "$(pwd)":/mnt:ro -w /mnt "${{ matrix.container }}" /bin/sh -s <<'CONTAINER'
             set -e
 
             # -----------------------------------------------------------------
@@ -138,6 +138,10 @@ jobs:
 
             grep -q "BEGIN SERVER-INIT MANAGED BLOCK" /etc/ssh/sshd_config \
               || { echo "❌ managed block missing"; exit 1; }
+
+            first_line=$(sed -n '1p' /etc/ssh/sshd_config)
+            test "$first_line" = "# BEGIN SERVER-INIT MANAGED BLOCK" \
+              || { echo "❌ managed block is not the first line: $first_line"; exit 1; }
 
             grep -Eq "^[[:space:]]*Port[[:space:]]+2222([[:space:]]|$)" /etc/ssh/sshd_config \
               || { echo "❌ Port 2222 not in config"; exit 1; }
@@ -208,8 +212,13 @@ jobs:
             test "$sudoers_count" = "1" \
               || { echo "❌ sudoers files multiplied on re-run (count=$sudoers_count)"; exit 1; }
 
+            for lock in /run/server-init/script.lock /var/lib/server-init/script.lock; do
+              test ! -d "$lock" \
+                || { echo "❌ script lock left behind after successful run: $lock"; exit 1; }
+            done
+
             echo "✅ ALL ASSERTIONS PASSED"
-          '
+          CONTAINER
 
   # -------------------------------------------------------------------
   # 3. Live restart + listen + connection test on one representative distro
@@ -226,7 +235,7 @@ jobs:
       - name: Live test
         run: |
           chmod +x init.sh
-          docker run --rm --privileged -v "$(pwd)":/mnt:ro -w /mnt ubuntu:22.04 /bin/sh -c '
+          docker run --rm --privileged -v "$(pwd)":/mnt:ro -w /mnt ubuntu:22.04 /bin/sh -s <<'CONTAINER'
             set -e
             apt-get update -qq
             apt-get install -y -qq curl sudo openssh-server iproute2 netcat-openbsd procps
@@ -263,8 +272,13 @@ jobs:
             echo "Banner: $banner"
             echo "$banner" | grep -q "SSH-2.0" || { echo "❌ no SSH banner on 2222"; exit 1; }
 
+            for lock in /run/server-init/script.lock /var/lib/server-init/script.lock; do
+              test ! -d "$lock" \
+                || { echo "❌ script lock left behind after live restart: $lock"; exit 1; }
+            done
+
             echo "✅ Live restart + listen + banner OK"
-          '
+          CONTAINER
 
   # -------------------------------------------------------------------
   # 4. Pre-existing-user safety test — ensure passwd -d does NOT clobber an
@@ -279,7 +293,7 @@ jobs:
       - name: Verify pre-existing user is left alone
         run: |
           chmod +x init.sh
-          docker run --rm --privileged -v "$(pwd)":/mnt:ro -w /mnt ubuntu:22.04 /bin/sh -c '
+          docker run --rm --privileged -v "$(pwd)":/mnt:ro -w /mnt ubuntu:22.04 /bin/sh -s <<'CONTAINER'
             set -e
             apt-get update -qq
             apt-get install -y -qq curl sudo openssh-server iproute2
@@ -331,7 +345,7 @@ jobs:
               exit 1
             fi
             echo "✅ Pre-existing user password preserved and sudoers untouched"
-          '
+          CONTAINER
 
   # -------------------------------------------------------------------
   # 5. Cross-user sudoers cleanup safety — verify the legacy-glob cleanup
@@ -348,7 +362,7 @@ jobs:
       - name: Verify glob does not match sibling usernames
         run: |
           chmod +x init.sh
-          docker run --rm --privileged -v "$(pwd)":/mnt:ro -w /mnt ubuntu:22.04 /bin/sh -c '
+          docker run --rm --privileged -v "$(pwd)":/mnt:ro -w /mnt ubuntu:22.04 /bin/sh -s <<'CONTAINER'
             set -e
             apt-get update -qq
             apt-get install -y -qq curl sudo openssh-server iproute2
@@ -397,7 +411,7 @@ jobs:
               || { echo "❌ admin stable sudoers missing"; ls /etc/sudoers.d/; exit 1; }
 
             echo "✅ Cross-user sudoers glob safety + operator-file safety verified"
-          '
+          CONTAINER
 
   # -------------------------------------------------------------------
   # 6. Legacy v4.6.x timestamped sudoers SHOULD be cleaned on re-run.
@@ -411,7 +425,7 @@ jobs:
       - name: Verify legacy-pattern file is removed
         run: |
           chmod +x init.sh
-          docker run --rm --privileged -v "$(pwd)":/mnt:ro -w /mnt ubuntu:22.04 /bin/sh -c '
+          docker run --rm --privileged -v "$(pwd)":/mnt:ro -w /mnt ubuntu:22.04 /bin/sh -s <<'CONTAINER'
             set -e
             apt-get update -qq
             apt-get install -y -qq curl sudo openssh-server iproute2
@@ -444,7 +458,7 @@ jobs:
               || { echo "❌ audit log missing specific path"; exit 1; }
 
             echo "✅ Legacy sudoers cleanup verified"
-          '
+          CONTAINER
 
   # -------------------------------------------------------------------
   # 7. CLI flag smoke — --version / --help / --no-ip-probe
@@ -458,7 +472,7 @@ jobs:
       - name: Smoke-test CLI flags
         run: |
           chmod +x init.sh
-          docker run --rm -v "$(pwd)":/mnt:ro -w /mnt ubuntu:22.04 /bin/sh -c '
+          docker run --rm -v "$(pwd)":/mnt:ro -w /mnt ubuntu:22.04 /bin/sh -s <<'CONTAINER'
             set -e
             # We need root for the script to run past the preflight check.
             # --version / --help exit BEFORE the root check, so they work
@@ -482,8 +496,44 @@ jobs:
             ./init.sh -h | grep -q -- "--help" \
               || { echo "❌ -h failed"; exit 1; }
 
+            check_no_lock() {
+              label="$1"
+              for lock in /run/server-init/script.lock /var/lib/server-init/script.lock; do
+                test ! -d "$lock" \
+                  || { echo "❌ script lock leaked after $label: $lock"; exit 1; }
+              done
+            }
+
+            check_no_lock "--version/--help"
+
+            if ./init.sh --user=a --user=b --yes >/tmp/dup-user.out 2>&1; then
+              echo "❌ duplicate --user unexpectedly succeeded"
+              cat /tmp/dup-user.out
+              exit 1
+            fi
+            check_no_lock "duplicate --user"
+
+            if ./init.sh --port= --yes >/tmp/empty-port.out 2>&1; then
+              echo "❌ empty --port unexpectedly succeeded"
+              cat /tmp/empty-port.out
+              exit 1
+            fi
+            check_no_lock "empty --port"
+
+            if ./init.sh \
+                --user=deploy \
+                --port=03306 \
+                --key-raw="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPQQDejyTCPJO3Jyw5UX9jmojb/zjgcqVuRO28fmpWU5 ci@test" \
+                --no-update --no-bbr --delay-restart --no-ip-probe --yes --strict \
+                >/tmp/leading-zero-port.out 2>&1; then
+              echo "❌ leading-zero --port unexpectedly succeeded"
+              cat /tmp/leading-zero-port.out
+              exit 1
+            fi
+            check_no_lock "leading-zero --port"
+
             echo "✅ CLI flag smoke OK"
-          '
+          CONTAINER
 
   # -------------------------------------------------------------------
   # 8. --no-ip-probe actually skips the ipify lookup
@@ -497,7 +547,7 @@ jobs:
       - name: Verify --no-ip-probe skips ipify call
         run: |
           chmod +x init.sh
-          docker run --rm --privileged -v "$(pwd)":/mnt:ro -w /mnt ubuntu:22.04 /bin/sh -c '
+          docker run --rm --privileged -v "$(pwd)":/mnt:ro -w /mnt ubuntu:22.04 /bin/sh -s <<'CONTAINER'
             set -e
             apt-get update -qq
             apt-get install -y -qq curl sudo openssh-server iproute2
@@ -519,7 +569,7 @@ jobs:
             fi
 
             echo "✅ --no-ip-probe verified"
-          '
+          CONTAINER
 
   # -------------------------------------------------------------------
   # 9. ACCOUNT_LOCKED warning fires when key deployment fails (non-strict)
@@ -533,7 +583,7 @@ jobs:
       - name: Verify ACCOUNT_LOCKED_REASON path
         run: |
           chmod +x init.sh
-          docker run --rm --privileged -v "$(pwd)":/mnt:ro -w /mnt ubuntu:22.04 /bin/sh -c '
+          docker run --rm --privileged -v "$(pwd)":/mnt:ro -w /mnt ubuntu:22.04 /bin/sh -s <<'CONTAINER'
             set -e
             apt-get update -qq
             apt-get install -y -qq curl sudo openssh-server iproute2
@@ -558,8 +608,13 @@ jobs:
             passwd -S deploy_locked | awk "{print \$2}" | grep -qE "^L\$|^LK\$" \
               || { echo "❌ deploy_locked is not locked"; passwd -S deploy_locked; exit 1; }
 
+            for lock in /run/server-init/script.lock /var/lib/server-init/script.lock; do
+              test ! -d "$lock" \
+                || { echo "❌ script lock left behind after non-strict key failure: $lock"; exit 1; }
+            done
+
             echo "✅ ACCOUNT_LOCKED path verified"
-          '
+          CONTAINER
 
   # -------------------------------------------------------------------
   # 10. restore.sh refuses when checksums.sha256 is missing; FORCE=1 overrides
@@ -573,7 +628,7 @@ jobs:
       - name: Verify checksum gate + FORCE=1
         run: |
           chmod +x init.sh
-          docker run --rm --privileged -v "$(pwd)":/mnt:ro -w /mnt ubuntu:22.04 /bin/sh -c '
+          docker run --rm --privileged -v "$(pwd)":/mnt:ro -w /mnt ubuntu:22.04 /bin/sh -s <<'CONTAINER'
             set -e
             apt-get update -qq
             apt-get install -y -qq curl sudo openssh-server iproute2
@@ -605,4 +660,4 @@ jobs:
               exit 1
             fi
             echo "✅ FORCE=1 successfully bypassed"
-          '
+          CONTAINER
